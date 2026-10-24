@@ -71,6 +71,9 @@
 const int extra_context_handle_fragmentation = 128;
 const int MEDIA_TOKEN_IDENTIFIER_A = -998; //alternate between both, changing when image changes
 const int MEDIA_TOKEN_IDENTIFIER_B = -999;
+//media-derived placeholder tokens: pass as a media_identifier to get them
+const int MEDIA_TOKEN_CONTENT = 0;
+const int MEDIA_TOKEN_LOWEST = MEDIA_TOKEN_IDENTIFIER_B - 1 - (1 << 30);
 
 //shared
 std::string executable_path = "";
@@ -136,7 +139,7 @@ static std::vector<media_object> media_objects;
 static std::vector<int> last_media_mem; //for storing dummy tokens that will be consumed by mtmd
 static std::vector<int> media_object_token_counts; //per media object dummy token counts for inline placeholders
 static std::string media_composite_image_signature = ""; //for identifying when the media changes, we need to invalidate the cache
-static int current_media_identifier = MEDIA_TOKEN_IDENTIFIER_A;
+static int current_media_identifier = MEDIA_TOKEN_CONTENT; //never swapped: the tokens carry the media
 static int vision_max_res = 2048;
 static bool use_mrope = false;
 
@@ -2622,12 +2625,37 @@ static bool mtmd_text_chunk_has_invalid_tokens(const mtmd_input_chunk * mtmdchun
 
 static bool kcpp_is_media_token(int token)
 {
-    return token <= MEDIA_TOKEN_IDENTIFIER_A && token > MEDIA_TOKEN_IDENTIFIER_A - 4096;
+    return token <= MEDIA_TOKEN_IDENTIFIER_A && token >= MEDIA_TOKEN_LOWEST;
+}
+
+//the placeholder token for objects[media_index]. With MEDIA_TOKEN_CONTENT it comes from the media's
+//own bytes, so the same picture has the same tokens in every request and conversation, and a token
+//prefix match means the media match: appending a picture keeps every earlier token, and a snapshot
+//is reusable whenever its tokens are a prefix. Any other identifier keeps the positional scheme.
+static int kcpp_placeholder_token(const std::vector<media_object> & objects, int media_index, int media_identifier)
+{
+    if(media_identifier != MEDIA_TOKEN_CONTENT)
+    {
+        return media_identifier - (media_index * 2);
+    }
+    const media_object & object = objects[media_index];
+    size_t occurrence = 0; //the same media twice in one request still gets two tokens
+    for(int j=0;j<media_index;++j)
+    {
+        if(objects[j].is_audio==object.is_audio && objects[j].b64data==object.b64data)
+        {
+            ++occurrence;
+        }
+    }
+    const size_t key = std::hash<std::string>{}(object.b64data)
+        ^ (object.is_audio ? (size_t)0x9e3779b97f4a7c15ULL : (size_t)0)
+        ^ (occurrence * (size_t)0x100000001b3ULL);
+    return MEDIA_TOKEN_IDENTIFIER_B - 1 - (int)(key % ((size_t)1 << 30));
 }
 
 static int kcpp_media_token_for_index(int media_index)
 {
-    return current_media_identifier - (media_index * 2);
+    return kcpp_placeholder_token(media_objects, media_index, current_media_identifier);
 }
 
 static int kcpp_media_index_from_token(int token)
@@ -2636,12 +2664,14 @@ static int kcpp_media_index_from_token(int token)
     {
         return -1;
     }
-    const int diff = current_media_identifier - token;
-    if(diff < 0 || (diff % 2) != 0)
+    for(int i=0;i<(int)media_objects.size();++i)
     {
-        return -1;
+        if(kcpp_placeholder_token(media_objects, i, current_media_identifier)==token)
+        {
+            return i;
+        }
     }
-    return diff / 2;
+    return (int)media_objects.size(); //a media token for nothing here: the caller reports the mismatch
 }
 
 static bool kcpp_parse_attached_media_placeholder(
@@ -2726,14 +2756,15 @@ static void kcpp_append_media_placeholder_tokens(
     std::vector<int> & tokens,
     int media_index,
     const std::vector<int> & token_counts,
+    const std::vector<media_object> & objects,
     int media_identifier)
 {
-    if(media_index < 0 || media_index >= (int) token_counts.size())
+    if(media_index < 0 || media_index >= (int) token_counts.size() || media_index >= (int) objects.size())
     {
         return;
     }
     const int token_count = token_counts[media_index];
-    const int media_token = media_identifier - (media_index * 2);
+    const int media_token = kcpp_placeholder_token(objects, media_index, media_identifier);
     for(int i = 0; i < token_count; ++i)
     {
         tokens.push_back(media_token);
@@ -2781,7 +2812,7 @@ static bool kcpp_tokenize_prompt_with_inline_media(
                 TokenizeString("", bos, file_format, true);
                 output_tokens.insert(output_tokens.end(), bos.begin(), bos.end());
             }
-            kcpp_append_media_placeholder_tokens(output_tokens, media_index, token_counts, media_identifier);
+            kcpp_append_media_placeholder_tokens(output_tokens, media_index, token_counts, objects, media_identifier);
             emitted_anything = true;
             inserted_media = true;
             pos += placeholder_len - 1;
@@ -6435,7 +6466,7 @@ static bool PrepareMediaEmbdsForObjects(
                 {
                     tokcnt += introsize + outrosize;
                 }
-                const int media_token = media_identifier - (i * 2);
+                const int media_token = kcpp_placeholder_token(objects, i, media_identifier);
                 for(int n=0;n<tokcnt;++n)
                 {
                     placeholder_tokens.push_back(media_token);
@@ -6757,7 +6788,7 @@ static int get_nearby_compatible_smartcache_slot()
             continue;
         }
         const auto & slot_tokens = savestates[i].savestate_context_tokens;
-        if(slot_tokens.empty() || savestates[i].media_signature!=media_composite_image_signature)
+        if(slot_tokens.empty())
         {
             continue;
         }
@@ -7032,7 +7063,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             lv.is_audio = false;
             TokenizeString("\n\n", lv.chunk_end_seq, file_format, false);
             media_objects.push_back(lv);
-            new_media_composite += item;
+            new_media_composite += "i" + std::to_string(std::hash<std::string>{}(item)) + ":" + std::to_string(item.size()) + "|";
         }
     }
     for(int x=0;x<inputs.audio_len;++x)
@@ -7045,13 +7076,13 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             lv.is_audio = true;
             TokenizeString("\n\n", lv.chunk_end_seq, file_format, false);
             media_objects.push_back(lv);
-            new_media_composite += item;
+            new_media_composite += "a" + std::to_string(std::hash<std::string>{}(item)) + ":" + std::to_string(item.size()) + "|";
         }
     }
     if(media_composite_image_signature!=new_media_composite)
     {
-        //images have changed. swap identifiers to force reprocessing
-        current_media_identifier = (current_media_identifier==MEDIA_TOKEN_IDENTIFIER_A?MEDIA_TOKEN_IDENTIFIER_B:MEDIA_TOKEN_IDENTIFIER_A);
+        //images have changed: rebuild them. No identifier swap - a changed picture has different
+        //tokens by itself, and the pictures that stayed keep theirs.
         media_composite_image_signature = new_media_composite;
         if(debugmode==1 && !is_quiet)
         {
@@ -7401,10 +7432,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     // {
                     //     printf("%d, ",savestates[i].savestate_context_tokens[x]);
                     // }
-                    if(savestates[i].media_signature!=media_composite_image_signature)
-                    {
-                        target_usable = false;
-                    }
                     int target_len = savestates[i].savestate_context_tokens.size();
                     if(target_usable && target_len>bestlen)
                     {
@@ -7464,10 +7491,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         continue;
                     }
                     float similaritybeat = ComputePrefixMatchPercent(savestates[i].savestate_context_tokens,embd_inp);
-                    if(savestates[i].media_signature!=media_composite_image_signature)
-                    {
-                        continue;
-                    }
                     if(similaritybeat > similarity_threshold || (shiftable && CanContextShift(savestates[i].savestate_context_tokens, embd_inp, inputs.max_length, nctx)))
                     {
                         foundswap = smartcache_switch_slot(i);
@@ -7947,6 +7970,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 fprintf(stderr, "\nFailed to predict at token position %d! Check your context buffer sizes!\n",n_past);
                 fflush(stderr);
                 media_composite_image_signature = ""; //force invalidate
+                current_context_tokens.clear(); //and the context that half-read it is not reused
                 output.text = nullptr;
                 output.status = 0;
                 output.prompt_tokens = output.completion_tokens = 0;
@@ -8495,6 +8519,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 if(!err)
                                 {
                                     media_composite_image_signature = ""; //force invalidate
+                                    current_context_tokens.clear(); //and the context that half-read it is not reused
                                     fprintf(stderr, "\nFailed to eval media tokens at %d!\n",n_past);
                                     output.text = nullptr;
                                     output.status = 0;
@@ -8542,6 +8567,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         if(mediatokenscounted!=mediatokensevaled)
                         {
                             media_composite_image_signature = ""; //force invalidate
+                            current_context_tokens.clear(); //and the context that half-read it is not reused
                             fprintf(stderr, "\nMedia tokens mismatch at %d! (%d vs %d tokens)\n",n_past,mediatokenscounted,mediatokensevaled);
                             output.text = nullptr;
                             output.status = 0;
@@ -8872,7 +8898,7 @@ int get_identical_existing_slot() //returns slot number of slot containing exact
     int currctxsize = current_context_tokens.size();
     for(int i=0;i<savestate_limit;++i)
     {
-        if(smartcache_slot_usable(i) && savestates[i].savestate_context_tokens.size() == currctxsize && savestates[i].media_signature==media_composite_image_signature)
+        if(smartcache_slot_usable(i) && savestates[i].savestate_context_tokens.size() == currctxsize)
         {
             bool is_identical = true;
             const auto& slot_tokens = savestates[i].savestate_context_tokens;
